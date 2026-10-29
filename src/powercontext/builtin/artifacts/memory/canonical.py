@@ -87,6 +87,19 @@ def normalize_text(value: str) -> str:
     return normalized
 
 
+def normalize_entry_text(*, kind: str, text: str, source_refs: Sequence[object]) -> str:
+    """Preserve source evidence bodies that cannot be shortened to a Memory note.
+
+    Source-backed evidence is an exact retrieval projection, rather than a
+    generated note. Its identity and hash must cover its complete text both at
+    commit and when an immutable version is subsequently verified.
+    """
+
+    if normalize_kind(kind) == "source-evidence" and source_refs:
+        return _normalize_non_empty_string(text, "memory entry text")
+    return normalize_text(text)
+
+
 def normalize_query(value: str) -> str:
     """Normalize one transient retrieval query.
 
@@ -160,7 +173,7 @@ def entry_content_bytes(
 
     return canonical_json({
         "kind": normalize_kind(kind),
-        "text": normalize_text(text),
+        "text": normalize_entry_text(kind=kind, text=text, source_refs=source_refs),
         "source_refs": normalize_refs(source_refs),
         "artifact_refs": normalize_refs(artifact_refs),
     })

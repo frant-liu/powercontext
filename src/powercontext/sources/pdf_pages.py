@@ -13,6 +13,8 @@ from __future__ import annotations
 import hashlib
 import io
 import math
+import re
+import unicodedata
 from collections import Counter
 from urllib.parse import quote
 
@@ -26,6 +28,21 @@ from powercontext.limits import MAX_SOURCE_ID_LENGTH
 from powercontext.sources.definitions import SourceDefinition, SourceProjection
 from powercontext.sources.models import Source, SourceMaterialization
 from powercontext.sources.projections import TEXT_EVIDENCE_PROJECTION_KEY, TextEvidence
+
+
+class _PDFInputError(ValueError):
+    def __init__(self, code: str) -> None:
+        messages = {
+            "document-id": "document_id must be non-empty",
+            "digest": "document_sha256 must be a lowercase SHA-256 digest",
+            "page": "page_number must be a positive integer",
+            "identity": "PDF page number exceeds the identity size limit",
+            "password": "PDF requires a non-empty password",
+            "parse": "PDF could not be fully parsed",
+            "question": "question must be non-empty",
+            "limit": "limit must be a positive integer",
+        }
+        super().__init__(messages[code])
 
 
 class PDFDocumentInput(BaseModel):
@@ -98,46 +115,218 @@ class _PDFPageSourceDefinition:
         )
 
 
-PDF_PAGE_SOURCE_DEFINITION: SourceDefinition[PDFPageInput, PDFPageSource, PDFPageInput] = (
-    _PDFPageSourceDefinition()
-)
+PDF_PAGE_SOURCE_DEFINITION: SourceDefinition[PDFPageInput, PDFPageSource, PDFPageInput] = _PDFPageSourceDefinition()
 
-_PDF_QUERY_STOPWORDS = frozenset(
-    "a an and are as at be by can for from give has have if in is it less not of on or only reported "
-    "relying should shown state that the then these this to what when where which with within would".split()
-)
-_PDF_QUERY_EXPANSIONS: tuple[tuple[frozenset[str], tuple[str, ...]], ...] = (
+_PDF_QUERY_STOPWORDS = frozenset([
+    "a",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "by",
+    "can",
+    "for",
+    "from",
+    "give",
+    "has",
+    "have",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "less",
+    "not",
+    "of",
+    "on",
+    "or",
+    "only",
+    "reported",
+    "relying",
+    "should",
+    "shown",
+    "state",
+    "that",
+    "the",
+    "then",
+    "these",
+    "this",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "with",
+    "within",
+    "would",
+    "answer",
+    "respond",
+    "response",
+    "question",
+    "calculate",
+    "define",
+    "assuming",
+    "perspective",
+    "investment",
+    "analyst",
+    "use",
+    "detail",
+    "directly",
+    "explicitly",
+    "outlined",
+    "quantity",
+    "usd",
+    "million",
+    "billion",
+    "fiscal",
+    "fy",
+])
+_PDF_QUERY_EXPANSIONS: tuple[tuple[frozenset[str], str], ...] = (
     (
-        frozenset({"geography", "geographies", "geographic", "operate", "operates", "operating"}),
-        ("countries international markets regions north america united states"),
+        frozenset({"geography", "geographic", "operate", "country", "region"}),
+        "geographic geography countries international markets regions segments operations",
     ),
     (
-        frozenset({"legal", "battle", "battles", "lawsuit", "lawsuits", "litigation"}),
-        ("litigation legal proceedings claims contingencies"),
+        frozenset({"legal", "battle", "lawsuit", "litigation"}),
+        "litigation legal proceedings claims contingencies",
     ),
     (
         frozenset({"restructuring", "restructure"}),
-        ("restructuring impairment charges productivity costs"),
+        "restructuring impairment charges productivity costs",
     ),
     (
-        frozenset({"ebitda", "capex", "capital", "depreciation", "amortization", "margin"}),
-        ("operating income depreciation amortization capital expenditures cash flows"),
+        frozenset({"ebitda", "ebit", "profit", "income", "earning", "margin"}),
+        "income earnings profit operating revenue sales",
+    ),
+    (
+        frozenset({"ebitda", "depreciation", "amortization"}),
+        "depreciation amortization cash flows",
+    ),
+    (
+        frozenset({"capex", "expenditure", "spending"}),
+        "capital expenditures spending purchases property plant equipment cash flows",
+    ),
+    (
+        frozenset({"revenue", "sale"}),
+        "revenue revenues sales income",
+    ),
+    (
+        frozenset({"asset", "liability", "equity", "liquidity", "balance"}),
+        "balance sheets financial position assets liabilities equity",
     ),
 )
+_PDF_STATEMENT_TITLES = {
+    "income": re.compile(
+        r"(?:(?:consolidated|combined|condensed|unaudited)\s+)*"
+        r"(?:statements?\s+of\s+(?:income|operations|earnings|profit(?:\s+and\s+loss)?)|"
+        r"(?:income|profit\s+and\s+loss)\s+statements?)"
+    ),
+    "cash": re.compile(
+        r"(?:(?:consolidated|combined|condensed|unaudited)\s+)*"
+        r"(?:statements?\s+of\s+cash\s+flows?|cash\s+flows?\s+statements?)"
+    ),
+    "balance": re.compile(
+        r"(?:(?:consolidated|combined|condensed|unaudited)\s+)*"
+        r"(?:balance\s+sheets?|statements?\s+of\s+financial\s+position)"
+    ),
+}
+_PDF_SECTION_TITLES = (
+    (
+        frozenset({"geography", "geographic", "operate", "country", "region"}),
+        re.compile(
+            r"(?:our\s+)?(?:operations|business|segments|reportable segments|operating segments|"
+            r"geographic(?:al)? (?:information|areas|segments)|company overview)"
+        ),
+    ),
+    (
+        frozenset({"legal", "litigation", "lawsuit", "battle"}),
+        re.compile(r"(?:legal proceedings|litigation|commitments and contingencies|contingencies)"),
+    ),
+)
+
+
+def _pdf_terms(text: str) -> tuple[str, ...]:
+    """Normalize retrieval terms only; never change the captured page text."""
+
+    text = re.sub(r"\bfy\s*(\d{4})\b", r"\1", unicodedata.normalize("NFKC", text).casefold())
+    terms = re.findall(r"[^\W_]+", text, flags=re.UNICODE)
+    return tuple(
+        term[:-3] + "y"
+        if len(term) > 4 and term.endswith("ies")
+        else term[:-1]
+        if len(term) > 4 and term.endswith("s") and not term.endswith("ss")
+        else term
+        for term in terms
+    )
+
+
+def _requested_statements(terms: set[str]) -> set[str]:
+    kinds = set()
+    if terms & {"income", "earning", "profit", "ebitda", "ebit", "margin", "revenue", "sale"}:
+        kinds.add("income")
+    if terms & {"cash", "capex", "depreciation", "amortization"}:
+        kinds.add("cash")
+    if terms & {"asset", "liability", "equity", "liquidity", "balance"}:
+        kinds.add("balance")
+    return kinds
+
+
+def _page_statements(text: str) -> set[str]:
+    # Titles must be standalone headings near the top, rather than prose, an
+    # exhibit reference or a contents entry ending in a printed page number.
+    found = set()
+    for line in text.splitlines()[1:16]:
+        if re.search(r"\d", line):
+            continue
+        line = " ".join(re.findall(r"[a-z]+", line.casefold()))
+        for kind, pattern in _PDF_STATEMENT_TITLES.items():
+            match = pattern.fullmatch(line)
+            if match is None:
+                match = pattern.fullmatch(re.sub(r"\s+(?:continued|unaudited)$", "", line))
+            if match is not None:
+                found.add(kind)
+    # A directory listing multiple statement families is not a statement page.
+    return found if len(found) == 1 and len(re.findall(r"\d[\d,.]*", text)) >= 12 else set()
+
+
+def _has_requested_section(text: str, terms: set[str]) -> bool:
+    for triggers, pattern in _PDF_SECTION_TITLES:
+        if not triggers.intersection(terms):
+            continue
+        for line in text.splitlines()[1:]:
+            # SEC item/note numbers are headings, while a trailing page number
+            # indicates a directory entry. Do not promote cross references.
+            line = re.sub(r"^(?:item|note)\s+\d+[a-z]?\s*[.\-—:]?\s*", "", line.casefold().strip())
+            if pattern.fullmatch(line.strip(" .:")):
+                return True
+    return False
 
 
 def pdf_page_source_id(document_id: str, document_sha256: str, page_number: int, /) -> str:
     if not isinstance(document_id, str) or not document_id.strip():
-        raise ValueError("document_id must be non-empty")
-    if not isinstance(document_sha256, str) or len(document_sha256) != 64 or any(
-        char not in "0123456789abcdef" for char in document_sha256
+        raise _PDFInputError("document-id")
+    if (
+        not isinstance(document_sha256, str)
+        or len(document_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in document_sha256)
     ):
-        raise ValueError("document_sha256 must be a lowercase SHA-256 digest")
+        raise _PDFInputError("digest")
     if isinstance(page_number, bool) or not isinstance(page_number, int) or page_number < 1:
-        raise ValueError("page_number must be a positive integer")
+        raise _PDFInputError("page")
     source_id = f"pdf:{quote(document_id, safe='')}:{document_sha256}:{page_number}"
     if len(source_id) > MAX_SOURCE_ID_LENGTH:
-        raise ValueError(f"PDF page source_id must not exceed {MAX_SOURCE_ID_LENGTH} characters")
+        # Keep revision and physical page explicit while bounding arbitrary
+        # caller-supplied document names. The distinct prefix avoids ambiguity
+        # with the reversible form used by existing citations.
+        document_key = hashlib.sha256(document_id.encode("utf-8")).hexdigest()
+        source_id = f"pdf-sha256:{document_key}:{document_sha256}:{page_number}"
+    if len(source_id) > MAX_SOURCE_ID_LENGTH:
+        raise _PDFInputError("identity")
     return source_id
 
 
@@ -145,13 +334,13 @@ def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
     """Extract every physical page, returning no partial result on failure."""
 
     if not isinstance(value.document_id, str) or not value.document_id.strip():
-        raise ValueError("document_id must be non-empty")
+        raise _PDFInputError("document-id")
     try:
         from pypdf import PdfReader
 
         reader = PdfReader(io.BytesIO(value.content), strict=True)
         if reader.is_encrypted and reader.decrypt("") == 0:
-            raise ValueError("PDF requires a non-empty password")
+            raise _PDFInputError("password")  # noqa: TRY301
         digest = hashlib.sha256(value.content).hexdigest()
         pages = tuple(
             PDFPageInput(
@@ -162,43 +351,53 @@ def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
             )
             for index, page in enumerate(reader.pages, start=1)
         )
-        return pages
     except ValueError:
         raise
     except Exception as error:
-        raise ValueError("PDF could not be fully parsed") from error
+        raise _PDFInputError("parse") from error
+    else:
+        return pages
 
 
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
-    """Search page evidence with lexical expansion and rank the full candidate pool."""
+    """Retrieve exact Memory citations, including tables needed by financial queries."""
 
     if not isinstance(question, str) or not question.strip():
-        raise ValueError("question must be non-empty")
+        raise _PDFInputError("question")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise ValueError("limit must be a positive integer")
+        raise _PDFInputError("limit")
     candidate_limit = min(max(limit * 16, 256), 512)
     queries = [question]
-    question_terms = tuple(dict.fromkeys(analyze_text(question).split()))
+    question_terms = tuple(dict.fromkeys(_pdf_terms(question)))
     query_terms = set(question_terms)
-    expanded_terms: Counter[str] = Counter()
+    expanded_terms: set[str] = set()
+    expansion_words: list[str] = []
     for triggers, expansion in _PDF_QUERY_EXPANSIONS:
         if query_terms.intersection(triggers):
-            terms = expansion.split()
-            expanded_terms.update(terms)
+            expansion_words.extend(expansion.split())
+            expanded_terms.update(_pdf_terms(expansion))
 
     retrieval_terms = tuple(
         term
-        for term in (*question_terms, *expanded_terms.keys())
+        for term in (*analyze_text(question).split(), *question_terms, *expansion_words)
         if term not in _PDF_QUERY_STOPWORDS and len(term) > 1
     )
     retrieval_terms = tuple(dict.fromkeys(retrieval_terms))
-    queries.extend(
-        " ".join(retrieval_terms[index : index + 2])
-        for index in range(0, len(retrieval_terms), 2)
-    )
+    queries.extend(" ".join(retrieval_terms[index : index + 2]) for index in range(0, len(retrieval_terms), 2))
 
-    candidates: dict[tuple[str, str, str, str], tuple[MemoryHit, int]] = {}
-    for query in queries:
+    # Short queries bypass long-query minimum coverage, which otherwise drops
+    # tables using a different accounting label (e.g. profit versus income).
+    for kind in sorted(_requested_statements(query_terms)):
+        queries.extend(
+            {
+                "income": ("statement income", "statements operations", "statements earnings"),
+                "cash": ("statement cash",),
+                "balance": ("balance sheet", "financial position"),
+            }[kind]
+        )
+
+    candidates: dict[tuple[str, int, str, str], tuple[MemoryHit, int]] = {}
+    for query in dict.fromkeys(queries):
         result = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=candidate_limit))
         for rank, hit in enumerate(result.hits, start=1):
             key = (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry_id, hit.entry_version_id)
@@ -217,54 +416,71 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
 
 def _rank_pdf_candidates(
     question: str,
-    expanded_terms: Counter[str],
+    expanded_terms: set[str],
     candidates: tuple[tuple[MemoryHit, int], ...],
 ) -> tuple[MemoryHit, ...]:
     if not candidates:
         return ()
 
-    original_terms = tuple(
-        term
-        for term in analyze_text(question).split()
-        if term not in _PDF_QUERY_STOPWORDS and len(term) > 1
-    )
-    weights = {term: float(frequency) for term, frequency in Counter(original_terms).items()}
-    for term, frequency in expanded_terms.items():
-        weights[term] = max(weights.get(term, 0.0), 0.45 * frequency)
+    original_terms = {term for term in _pdf_terms(question) if term not in _PDF_QUERY_STOPWORDS and len(term) > 1}
+    weights = dict.fromkeys(sorted(original_terms), 1.0)
+    for term in sorted(expanded_terms):
+        weights.setdefault(term, 0.35)
 
-    tokenized = [Counter(analyze_text(hit.text).split()) for hit, _rank in candidates]
-    document_frequency = Counter(term for frequencies in tokenized for term in frequencies.keys())
+    scores = _pdf_lexical_scores(tuple(hit.text for hit, _rank in candidates), weights, original_terms)
+    scale = max(scores) or 1.0
+    requested_statements = _requested_statements(original_terms)
+    # Document identifiers commonly carry the company and reporting year. Use
+    # those terms as a prior, not a filter: an annual report also covers earlier
+    # years and a question may require more than one report.
+    query_years = {term for term in original_terms if re.fullmatch(r"(?:19|20)\d{2}", term)}
+    identifiers = [set(_pdf_terms(hit.text.partition("\n")[0])) for hit, _rank in candidates]
+    company_terms = set().union(*identifiers) & original_terms - query_years
+    company_terms -= {"annual", "report", "10k", "10q", "form"}
+    reranked = []
+    for score, (hit, rank), identifier in zip(scores, candidates, identifiers, strict=True):
+        if company_terms:
+            score += scale * 0.6 * len(identifier & company_terms) / len(company_terms)
+        if query_years & identifier:
+            score += scale * 0.15
+        if requested_statements & _page_statements(hit.text):
+            score += scale * 0.9
+        if _has_requested_section(hit.text, original_terms):
+            score += scale * 0.75
+        reranked.append((score, rank, hit))
+    reranked.sort(key=lambda item: (-item[0], item[1], item[2].entry_id, item[2].entry_version_id))
+    return tuple(hit for _score, _rank, hit in reranked)
+
+
+def _pdf_lexical_scores(
+    texts: tuple[str, ...], weights: dict[str, float], original_terms: set[str]
+) -> tuple[float, ...]:
+    tokenized = [Counter(_pdf_terms(text)) for text in texts]
+    document_frequency = Counter(term for frequencies in tokenized for term in frequencies)
     average_length = max(1.0, sum(sum(frequencies.values()) for frequencies in tokenized) / len(tokenized))
-    total_documents = len(candidates)
-    scored: list[tuple[float, int, MemoryHit]] = []
-    for (hit, rank), frequencies in zip(candidates, tokenized, strict=True):
+    scores = []
+    for frequencies in tokenized:
         document_length = sum(frequencies.values())
         score = 0.0
-        matched_original: set[str] = set()
         for term, weight in weights.items():
             frequency = frequencies[term]
             if not frequency:
                 continue
-            if term in original_terms:
-                matched_original.add(term)
-            document_frequency_for_term = document_frequency[term]
-            inverse_document_frequency = math.log(
-                1 + (total_documents - document_frequency_for_term + 0.5) / (document_frequency_for_term + 0.5)
-            )
+            count = document_frequency[term]
+            inverse_document_frequency = math.log(1 + (len(texts) - count + 0.5) / (count + 0.5))
             denominator = frequency + 1.2 * (0.25 + 0.75 * document_length / average_length)
             score += weight * inverse_document_frequency * frequency * 2.2 / denominator
         if original_terms:
-            score += 0.35 * len(matched_original) / len(set(original_terms))
-        scored.append((score, rank, hit))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return tuple(hit for _score, _rank, hit in scored)
+            score += 0.35 * len(original_terms.intersection(frequencies)) / len(original_terms)
+        scores.append(score)
+    return tuple(scores)
 
 
 __all__ = [
+    "PDF_PAGE_SOURCE_DEFINITION",
     "PDFDocumentInput",
     "PDFPageInput",
     "PDFPageSource",
-    "PDF_PAGE_SOURCE_DEFINITION",
     "parse_pdf_document",
     "pdf_page_source_id",
     "search_pdf_pages",
