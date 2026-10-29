@@ -138,6 +138,9 @@ from powercontext.builtin.inference import (
 )
 from powercontext.builtin.inference.models import InferenceUsage
 from powercontext.builtin.inference.usage import bind_usage_reporter
+from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
+from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.agent_skill_targets import RemoteAgentSkillTarget
 from powercontext.builtin.persistence.artifact_governance import (
     ArtifactGovernance,
@@ -488,6 +491,7 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
+            self._wake_source_processing()
             return SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
@@ -504,7 +508,13 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
+            self._wake_source_processing()
             return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
+
+    def _wake_source_processing(self) -> None:
+        supervisor = self._runtime.artifact_processing_supervisor
+        if supervisor is not None:
+            supervisor.wake()
 
 
 class SourceApplication:
@@ -531,11 +541,13 @@ class ScopedRecordApplication:
         /,
     ) -> SourceRecord:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_source(
+            record = await self._runtime._records().create_source(
                 self.scope_id,
                 source_type,
                 content,
             )
+        self._wake_source_processing()
+        return record
 
     async def get_source(self, source_type: str, source_id: str, /) -> SourceRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -563,7 +575,14 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            artifact = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        self._wake_source_processing()
+        return artifact
+
+    def _wake_source_processing(self) -> None:
+        supervisor = self._runtime.artifact_processing_supervisor
+        if supervisor is not None:
+            supervisor.wake()
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -846,6 +865,22 @@ class ScopedContextApplication:
             if authorize_scopes is not None:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        base_pack: ContextPack | None = None,
+    ) -> ContextPack | ContextPackDelta:
+        """Prepare a complete pack or a delta against the caller's serialized base."""
+
+        prepared = await self.prepare(request)
+        target = ContextPack.from_content(prepared.content or "")
+        if base_pack is None:
+            return target
+        if not isinstance(base_pack, ContextPack):
+            raise TypeError("base_pack must be a ContextPack")
+        return ContextPackDelta.between(base_pack, target)
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)
@@ -2683,7 +2718,7 @@ class ScopedTopicMemoryApplication:
                         "unit": "topic-memory",
                     },
                 )
-        return result
+        return await self._runtime.lifecycle.for_scope(self.scope_id).filter_topic_result(result)
 
     async def _search_with_embedding(
         self,
@@ -3027,6 +3062,7 @@ class BuiltinRuntime:
         remote_ingestion: RemoteIngestion | None = None,
         dream_service: DreamService | None = None,
         generation_concurrency: int = 4,
+        source_lifecycle_database: AsyncDatabase | None = None,
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
@@ -3069,6 +3105,7 @@ class BuiltinRuntime:
         self._remote_skill_distribution = remote_skill_distribution
         self._statistics_service = statistics_service
         self._record_service = record_service
+        self.lifecycle = SourceLifecycleApplication(self, source_lifecycle_database)
         self._prompt_service = prompt_service
         self._recall_token_estimator = recall_token_estimator
         self._recall_effort_sink = recall_effort_sink

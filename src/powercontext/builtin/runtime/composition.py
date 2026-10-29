@@ -651,6 +651,7 @@ async def open_builtin_runtime(
                 scheduled_source_runner=scheduled_source_runner,
                 scheduled_experience_runner=scheduled_experience_runner,
                 remote_ingestion=contexts,
+                source_lifecycle_database=contexts.database,
             )
         )
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
@@ -785,7 +786,21 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 timezone=config.runtime.profile_timezone if family == "profile" else "Asia/Shanghai",
                 pending_provider=None
                 if family == "skill"
-                else SourceProcessingPendingProvider(contexts.database, binding, family),
+                else SourceProcessingPendingProvider(
+                    contexts.database,
+                    binding,
+                    family,
+                    source_count_threshold=(
+                        getattr(config.runtime, f"{prefix}_source_count_threshold", None)
+                        if family in {"memory", "topic-memory"}
+                        else None
+                    ),
+                ),
+                source_count_threshold=(
+                    getattr(config.runtime, f"{prefix}_source_count_threshold", None)
+                    if family in {"memory", "topic-memory"}
+                    else None
+                ),
                 automatic_scope_filter=enabled_profile_scopes if family == "profile" else None,
             )
         )
@@ -960,7 +975,7 @@ async def open_builtin_contexts(
                 await contexts.aclose_usage_recorder()
         return
     experience_index = OceanBaseExperienceFTSIndex()
-    indexes = [OceanBaseMemoryFTSIndex()]
+    indexes = [OceanBaseMemoryFTSIndex(hybrid_search_enabled=isinstance(database, SeekDBConfig))]
     if embedding_model is not None:
         indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
     index = CompositeMemoryIndex(*indexes)

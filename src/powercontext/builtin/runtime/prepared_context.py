@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +108,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[EvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,14 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class EvidenceFragment:
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -211,6 +222,8 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            return self._build_evidence_selection(request, current_scope_id, memory_candidates)
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -255,6 +268,107 @@ class PreparedContextBuilder:
             origins=origins,
             omissions=omissions,
         )
+
+    def _build_evidence_selection(
+        self,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        query_terms = tuple(dict.fromkeys(_evidence_terms(request.query)))
+        if not query_terms:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        entries: list[tuple[str, MemoryHit, str, int, int, str, tuple[str, ...]]] = []
+        document_frequency: Counter[str] = Counter()
+        seen_entries: set[tuple[str, str, int, str, str]] = set()
+        for group in memory_candidates:
+            for hit in group.hits:
+                if hit.memory_ref != group.memory_ref or not hit.text:
+                    continue
+                identity = (
+                    group.scope_id,
+                    hit.memory_ref.artifact_id,
+                    hit.memory_ref.revision,
+                    hit.entry_id,
+                    hit.entry_version_id,
+                )
+                if identity in seen_entries:
+                    continue
+                seen_entries.add(identity)
+                terms = tuple(_evidence_terms(hit.text))
+                document_frequency.update(set(terms).intersection(query_terms))
+                for start, end in _evidence_spans(hit.text):
+                    text = hit.text[start:end]
+                    matched = tuple(term for term in query_terms if term in set(_evidence_terms(text)))
+                    if matched:
+                        entries.append((group.scope_id, hit, hit.text, start, end, text, matched))
+        if not entries:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        total_documents = max(1, len(seen_entries))
+
+        def priority(item: tuple[str, MemoryHit, str, int, int, str, tuple[str, ...]]) -> float:
+            length = max(1, len(item[5].encode("utf-8")))
+            relevance = sum(1.0 + (total_documents - document_frequency[term]) / total_documents for term in item[6])
+            return relevance / length**0.35
+
+        remaining = list(entries)
+        selected: list[tuple[str, MemoryHit, str, int, int, str, tuple[str, ...]]] = []
+        selected_ranges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+        while remaining:
+            remaining.sort(key=priority, reverse=True)
+            candidate = remaining.pop(0)
+            scope_id, hit, _body, start, end, _text, _matched = candidate
+            key = (scope_id, hit.entry_id, hit.entry_version_id)
+            if any(start < old_end and end > old_start for old_start, old_end in selected_ranges.get(key, ())):
+                continue
+            selected.append(candidate)
+            selected_ranges.setdefault(key, []).append((start, end))
+            fragments, origins = self._evidence_fragments(selected, current_scope_id)
+            rendered = _render_evidence_context(fragments)
+            if len(rendered.encode("utf-8")) > request.max_bytes:
+                selected.pop()
+                selected_ranges[key].pop()
+                if not selected_ranges[key]:
+                    selected_ranges.pop(key)
+            if not remaining:
+                break
+
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        fragments, origins = self._evidence_fragments(selected, current_scope_id)
+        content = _render_evidence_context(fragments)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=origins,
+            fragments=fragments,
+        )
+
+    @staticmethod
+    def _evidence_fragments(
+        selected: Sequence[tuple[str, MemoryHit, str, int, int, str, tuple[str, ...]]],
+        current_scope_id: str | None,
+    ) -> tuple[tuple[EvidenceFragment, ...], tuple[PreparedContextOrigin, ...]]:
+        fragments = []
+        origins = []
+        for scope_id, hit, _body, start, end, text, _terms in selected:
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            fragments.append(EvidenceFragment(address=address, start=start, end=end, text=text))
+            origins.append(
+                MemoryCitation(
+                    memory_ref=hit.memory_ref,
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                if scope_id == current_scope_id
+                else address
+            )
+        return tuple(fragments), tuple(origins)
 
     def probe_budget(
         self,
@@ -722,6 +836,90 @@ def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
 
 def _rendered_bytes(entries: Sequence[_PreparedContextEntry]) -> int:
     return len(_render(entries).encode("utf-8"))
+
+
+def _evidence_terms(text: str) -> list[str]:
+    ignored = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "in",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "were",
+        "with",
+    }
+    return [term for term in re.findall(r"[a-z]+|\d+", text.casefold()) if term not in ignored]
+
+
+def _evidence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    sentences: list[tuple[int, int]] = []
+    for match in re.finditer(r"\S.*?(?:[.!?](?=\s|$)|\n+|$)", text, re.DOTALL):
+        start, end = match.span()
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start == end:
+            continue
+        if end - start <= 600:
+            sentences.append((start, end))
+            continue
+        chunk_start = start
+        chunk_end = start
+        for word in re.finditer(r"\S+", text[start:end]):
+            word_end = start + word.end()
+            if word_end - chunk_start > 500 and chunk_end > chunk_start:
+                sentences.append((chunk_start, chunk_end))
+                chunk_start = start + word.start()
+            chunk_end = word_end
+        if chunk_end > chunk_start:
+            sentences.append((chunk_start, chunk_end))
+    spans: set[tuple[int, int]] = set()
+    for index, (start, end) in enumerate(sentences):
+        spans.add((start, end))
+        for count in (2, 3):
+            stop = index + count
+            if stop <= len(sentences) and sentences[stop - 1][1] - start <= 600:
+                spans.add((start, sentences[stop - 1][1]))
+    return tuple(sorted(spans))
+
+
+def _render_evidence_context(fragments: Sequence[EvidenceFragment]) -> str:
+    payload = {
+        "trust": "untrusted_history",
+        "items": [
+            {
+                "citation": {
+                    "scope_id": fragment.address.memory.scope_id,
+                    "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": fragment.address.entry_id,
+                    "entry_version_id": fragment.address.entry_version_id,
+                },
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+            }
+            for fragment in fragments
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 def _truncate_utf8(text: str, byte_budget: int) -> str:
