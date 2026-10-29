@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
+from collections import Counter
 from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from powercontext.artifacts import MemoryCitation
+from powercontext.builtin.artifacts.memory.models import MemoryHit
+from powercontext.builtin.artifacts.search import analyze_text
 from powercontext.builtin.runtime.models import SearchMemoryRequest
 from powercontext.limits import MAX_SOURCE_ID_LENGTH
 from powercontext.sources.definitions import SourceDefinition, SourceProjection
@@ -98,6 +102,29 @@ PDF_PAGE_SOURCE_DEFINITION: SourceDefinition[PDFPageInput, PDFPageSource, PDFPag
     _PDFPageSourceDefinition()
 )
 
+_PDF_QUERY_STOPWORDS = frozenset(
+    "a an and are as at be by can for from give has have if in is it less not of on or only reported "
+    "relying should shown state that the then these this to what when where which with within would".split()
+)
+_PDF_QUERY_EXPANSIONS: tuple[tuple[frozenset[str], tuple[str, ...]], ...] = (
+    (
+        frozenset({"geography", "geographies", "geographic", "operate", "operates", "operating"}),
+        ("countries international markets regions north america united states"),
+    ),
+    (
+        frozenset({"legal", "battle", "battles", "lawsuit", "lawsuits", "litigation"}),
+        ("litigation legal proceedings claims contingencies"),
+    ),
+    (
+        frozenset({"restructuring", "restructure"}),
+        ("restructuring impairment charges productivity costs"),
+    ),
+    (
+        frozenset({"ebitda", "capex", "capital", "depreciation", "amortization", "margin"}),
+        ("operating income depreciation amortization capital expenditures cash flows"),
+    ),
+)
+
 
 def pdf_page_source_id(document_id: str, document_sha256: str, page_number: int, /) -> str:
     if not isinstance(document_id, str) or not document_id.strip():
@@ -143,35 +170,94 @@ def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
 
 
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
-    """Search the supplied scoped Memory and retain exact, distinct hit citations."""
+    """Search page evidence with lexical expansion and rank the full candidate pool."""
 
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be non-empty")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive integer")
-    result = await memory.search(SearchMemoryRequest(query=question, mode="auto", limit=limit))
-    citations: list[MemoryCitation] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    for hit in result.hits:
-        key = (
-            hit.memory_ref.artifact_id,
-            hit.memory_ref.revision,
-            hit.entry_id,
-            hit.entry_version_id,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        citations.append(
-            MemoryCitation(
-                memory_ref=hit.memory_ref,
-                entry_id=hit.entry_id,
-                entry_version_id=hit.entry_version_id,
+    candidate_limit = min(max(limit * 16, 256), 512)
+    queries = [question]
+    question_terms = tuple(dict.fromkeys(analyze_text(question).split()))
+    query_terms = set(question_terms)
+    expanded_terms: Counter[str] = Counter()
+    for triggers, expansion in _PDF_QUERY_EXPANSIONS:
+        if query_terms.intersection(triggers):
+            terms = expansion.split()
+            expanded_terms.update(terms)
+
+    retrieval_terms = tuple(
+        term
+        for term in (*question_terms, *expanded_terms.keys())
+        if term not in _PDF_QUERY_STOPWORDS and len(term) > 1
+    )
+    retrieval_terms = tuple(dict.fromkeys(retrieval_terms))
+    queries.extend(
+        " ".join(retrieval_terms[index : index + 2])
+        for index in range(0, len(retrieval_terms), 2)
+    )
+
+    candidates: dict[tuple[str, str, str, str], tuple[MemoryHit, int]] = {}
+    for query in queries:
+        result = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=candidate_limit))
+        for rank, hit in enumerate(result.hits, start=1):
+            key = (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry_id, hit.entry_version_id)
+            previous = candidates.get(key)
+            if previous is None:
+                candidates[key] = (hit, rank)
+            else:
+                candidates[key] = (previous[0], min(previous[1], rank))
+
+    ranked = _rank_pdf_candidates(question, expanded_terms, tuple(candidates.values()))
+    return tuple(
+        MemoryCitation(memory_ref=hit.memory_ref, entry_id=hit.entry_id, entry_version_id=hit.entry_version_id)
+        for hit in ranked[:limit]
+    )
+
+
+def _rank_pdf_candidates(
+    question: str,
+    expanded_terms: Counter[str],
+    candidates: tuple[tuple[MemoryHit, int], ...],
+) -> tuple[MemoryHit, ...]:
+    if not candidates:
+        return ()
+
+    original_terms = tuple(
+        term
+        for term in analyze_text(question).split()
+        if term not in _PDF_QUERY_STOPWORDS and len(term) > 1
+    )
+    weights = {term: float(frequency) for term, frequency in Counter(original_terms).items()}
+    for term, frequency in expanded_terms.items():
+        weights[term] = max(weights.get(term, 0.0), 0.45 * frequency)
+
+    tokenized = [Counter(analyze_text(hit.text).split()) for hit, _rank in candidates]
+    document_frequency = Counter(term for frequencies in tokenized for term in frequencies.keys())
+    average_length = max(1.0, sum(sum(frequencies.values()) for frequencies in tokenized) / len(tokenized))
+    total_documents = len(candidates)
+    scored: list[tuple[float, int, MemoryHit]] = []
+    for (hit, rank), frequencies in zip(candidates, tokenized, strict=True):
+        document_length = sum(frequencies.values())
+        score = 0.0
+        matched_original: set[str] = set()
+        for term, weight in weights.items():
+            frequency = frequencies[term]
+            if not frequency:
+                continue
+            if term in original_terms:
+                matched_original.add(term)
+            document_frequency_for_term = document_frequency[term]
+            inverse_document_frequency = math.log(
+                1 + (total_documents - document_frequency_for_term + 0.5) / (document_frequency_for_term + 0.5)
             )
-        )
-        if len(citations) == limit:
-            break
-    return tuple(citations)
+            denominator = frequency + 1.2 * (0.25 + 0.75 * document_length / average_length)
+            score += weight * inverse_document_frequency * frequency * 2.2 / denominator
+        if original_terms:
+            score += 0.35 * len(matched_original) / len(set(original_terms))
+        scored.append((score, rank, hit))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return tuple(hit for _score, _rank, hit in scored)
 
 
 __all__ = [
